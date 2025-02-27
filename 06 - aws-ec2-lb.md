@@ -1,72 +1,170 @@
-main.tf
-
+### main.tf
 ```
-provider "aws" {
-  region = var.region
+terraform {
+  required_version = ">= 0.12"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }
+  }
 }
 
-# Security Group to allow inbound HTTP traffic
+provider "aws" {
+  region = var.aws_region
+}
+
+# Create VPC
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+
+  tags = {
+    Name = "terraform-vpc"
+  }
+}
+
+# Create two public subnets in different AZs
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.subnet_cidr_a
+  availability_zone       = var.availability_zone_a
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "terraform-public-subnet-a"
+  }
+}
+
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.subnet_cidr_b
+  availability_zone       = var.availability_zone_b
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "terraform-public-subnet-b"
+  }
+}
+
+# Create an Internet Gateway and associate with VPC
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "terraform-igw"
+  }
+}
+
+# Create a public route table
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+
+  tags = {
+    Name = "terraform-public-rt"
+  }
+}
+
+# Associate the route table with the subnets
+resource "aws_route_table_association" "public_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id
+}
+
+# Security Group to allow HTTP and SSH
 resource "aws_security_group" "web_sg" {
-  name        = "web-sg"
-  description = "Allow HTTP traffic"
-  vpc_id      = var.vpc_id
+  name        = "web_sg"
+  description = "Allow HTTP and SSH"
+  vpc_id      = aws_vpc.main.id
 
   ingress {
+    description = "Allow HTTP"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "Allow SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
+    description = "Allow all outbound traffic"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "web_sg"
+  }
 }
 
-# Create two EC2 instances with a web server using count
+# Get the latest Amazon Linux 2 AMI
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
+
+# Create two EC2 instances running a simple web server
 resource "aws_instance" "web" {
   count         = 2
-  ami           = var.ami
-  instance_type = var.instance_type
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t2.micro"
+  subnet_id     = element([aws_subnet.public_a.id, aws_subnet.public_b.id], count.index)
   vpc_security_group_ids = [aws_security_group.web_sg.id]
-  subnet_id     = var.subnet_id  # If you are specifying a single subnet
-
   user_data = <<-EOF
     #!/bin/bash
     yum update -y
     yum install -y httpd
     systemctl start httpd
     systemctl enable httpd
-    echo "Hello from instance $(hostname)" > /var/www/html/index.html
+    echo "Hello from $(hostname)" > /var/www/html/index.html
   EOF
 
   tags = {
-    Name = "WebInstance-${count.index + 1}"
+    Name = "web-instance-${count.index}"
   }
 }
 
 # Create an Application Load Balancer
-resource "aws_lb" "web_alb" {
-  name               = "web-alb"
-  internal           = false
+resource "aws_lb" "web_lb" {
+  name               = "web-lb"
   load_balancer_type = "application"
+  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
   security_groups    = [aws_security_group.web_sg.id]
-  subnets            = var.alb_subnets
 
   tags = {
-    Name = "WebALB"
+    Name = "web-lb"
   }
 }
 
-# Create a Target Group for the web instances
+# Create a target group for the load balancer
 resource "aws_lb_target_group" "web_tg" {
   name     = "web-tg"
   port     = 80
   protocol = "HTTP"
-  vpc_id   = var.vpc_id
+  vpc_id   = aws_vpc.main.id
 
   health_check {
     healthy_threshold   = 3
@@ -74,13 +172,17 @@ resource "aws_lb_target_group" "web_tg" {
     timeout             = 5
     interval            = 30
     path                = "/"
-    matcher             = "200-399"
+    matcher             = "200"
+  }
+
+  tags = {
+    Name = "web-tg"
   }
 }
 
-# Create a Listener for the ALB to forward traffic to the target group
-resource "aws_lb_listener" "web_listener" {
-  load_balancer_arn = aws_lb.web_alb.arn
+# Create a listener for the load balancer
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.web_lb.arn
   port              = "80"
   protocol          = "HTTP"
 
@@ -90,61 +192,65 @@ resource "aws_lb_listener" "web_listener" {
   }
 }
 
-# Register the EC2 instances with the target group
-resource "aws_lb_target_group_attachment" "web_attachment" {
-  count            = length(aws_instance.web)
+# Register EC2 instances with the target group
+resource "aws_lb_target_group_attachment" "web" {
+  count            = 2
   target_group_arn = aws_lb_target_group.web_tg.arn
   target_id        = aws_instance.web[count.index].id
   port             = 80
 }
-
-
 ```
 
 ### variables.tf
 ```
-variable "region" {
+variable "aws_region" {
   description = "AWS region to deploy resources"
   type        = string
   default     = "us-east-1"
 }
 
-variable "instance_type" {
-  description = "EC2 instance type"
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC"
   type        = string
-  default     = "t2.micro"
+  default     = "10.0.0.0/16"
 }
 
-# Provide an appropriate AMI ID (for example, an Amazon Linux 2 AMI)
-variable "ami" {
-  description = "AMI ID to use for the EC2 instance"
+variable "subnet_cidr_a" {
+  description = "CIDR block for public subnet A"
   type        = string
+  default     = "10.0.1.0/24"
 }
 
-variable "vpc_id" {
-  description = "The VPC ID where resources will be deployed"
+variable "subnet_cidr_b" {
+  description = "CIDR block for public subnet B"
   type        = string
+  default     = "10.0.2.0/24"
 }
 
-# If your instances are launched into a specific subnet, set that subnet id here.
-variable "subnet_id" {
-  description = "Subnet ID for EC2 instances"
+variable "availability_zone_a" {
+  description = "Availability Zone for public subnet A"
   type        = string
+  default     = "us-east-1a"
 }
 
-# List of subnet IDs for the load balancer (should span at least two AZs for high availability)
-variable "alb_subnets" {
-  description = "List of subnet IDs for the load balancer"
-  type        = list(string)
+variable "availability_zone_b" {
+  description = "Availability Zone for public subnet B"
+  type        = string
+  default     = "us-east-1b"
 }
-
 ```
 
 ### outputs.tf
+```
+output "load_balancer_dns" {
+  description = "DNS name of the Application Load Balancer"
+  value       = aws_lb.web_lb.dns_name
+}
+
+output "instance_public_ips" {
+  description = "Public IP addresses of the EC2 instances"
+  value       = [for instance in aws_instance.web : instance.public_ip]
+}
 
 ```
-output "alb_dns_name" {
-  description = "DNS name of the Application Load Balancer"
-  value       = aws_lb.web_alb.dns_name
-}
-```
+
