@@ -12,8 +12,7 @@
 </head>
 
 <body>
-    <h1>This is a Design Version V8</h1>
-    <p>Welcome to Terraform Tutorial</p>
+    <h1>Hi, I am deployed using Terraform</h1>
 </body>
 
 </html>
